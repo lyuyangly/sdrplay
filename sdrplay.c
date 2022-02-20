@@ -253,7 +253,7 @@ int main(int argc, char *argv[])
         goto CloseApi;
     }
 
-    printf("Sample Rate = %.3f MHz, Tune Freq = %.3f MHz.\n", Fs/1e6, Freq/1e6);
+    printf("Sample Rate = %.3f MHz, Tune Freq = %.3f MHz\n", Fs/1e6, Freq/1e6);
 
     // Change from default Fs 2MHz - 10MHz
     deviceParams->devParams->fsFreq.fsHz = Fs;
@@ -271,7 +271,7 @@ int main(int argc, char *argv[])
     deviceParams->rxChannelA->tunerParams.bwType = bwType;
     deviceParams->rxChannelA->tunerParams.ifType = sdrplay_api_IF_Zero;
     deviceParams->rxChannelA->tunerParams.gain.gRdB = 40;
-    deviceParams->rxChannelA->tunerParams.gain.LNAstate = 1;
+    deviceParams->rxChannelA->tunerParams.gain.LNAstate = 0;
     deviceParams->rxChannelA->ctrlParams.agc.enable = sdrplay_api_AGC_100HZ; // sdrplay_api_AGC_DISABLE
 
     // Assign callback functions to be passed to sdrplay_api_Init()
