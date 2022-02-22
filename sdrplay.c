@@ -13,10 +13,11 @@
 #define FIR_TAPS 32
 
 static volatile int do_exit = 0;
-snd_pcm_t *handle;
+snd_pcm_t *pcm_handle;
 pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t g_pcm_cond = PTHREAD_COND_INITIALIZER;
-snd_pcm_uframes_t frames = 64;
+snd_pcm_uframes_t period_size = 128;
+snd_pcm_uframes_t buffer_size = 8192;
 sdrplay_api_DeviceT *chosenDevice = NULL;
 
 // Fir31, Gain = 1022, Fc = 0.1
@@ -34,19 +35,18 @@ int16_t *buffer;
 void *snd_pcm_thread(void *args)
 {
     int rc = 0;
-    snd_pcm_prepare(handle);
     while (!do_exit) {
         pthread_mutex_lock(&g_pcm_mutex);
         pthread_cond_wait(&g_pcm_cond, &g_pcm_mutex);
         pthread_mutex_unlock(&g_pcm_mutex);
-        rc = snd_pcm_writei(handle, buffer, frames);
+        rc = snd_pcm_writei(pcm_handle, buffer, period_size);
         if (rc == -EPIPE) {
             fprintf(stderr, "underrun occurred\n");
-            snd_pcm_prepare(handle);
+            snd_pcm_prepare(pcm_handle);
         } else if (rc < 0) {
             fprintf(stderr,"error from writei: %s\n", snd_strerror(rc));
-        } else if (rc != frames) {
-            fprintf(stderr,"short write, write %d frames\n", rc);
+        } else if (rc != period_size) {
+            fprintf(stderr,"short write, write %d period_size\n", rc);
         }
     }
     return args;
@@ -101,7 +101,7 @@ void StreamACallback(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params, 
                 // fwrite(&pcm, sizeof(pcm), 1, stdout);
                 // Write PCM Audio Data
                 buffer[pcm_cnt++] = pcm;
-                if (pcm_cnt == frames) {
+                if (pcm_cnt == period_size) {
                     pcm_cnt = 0;
                     pthread_mutex_lock(&g_pcm_mutex);
                     pthread_cond_signal(&g_pcm_cond);
@@ -173,15 +173,16 @@ int main(int argc, char *argv[])
     char c;
     int i, opt, rc;
     double Freq = 97.9e6;
-    double Fs = 2.4e6;
-    unsigned int PCM_Fs = 24000;
+    double Fs = 4.8e6;
+    unsigned int PCM_Fs = 48000;
     struct sigaction sigact;
     pthread_t pcm_thread;
     sdrplay_api_ErrT err;
     sdrplay_api_DeviceParamsT *deviceParams = NULL;
     sdrplay_api_CallbackFnsT cbFns;
     sdrplay_api_Bw_MHzT bwType;
-    snd_pcm_hw_params_t *params;
+    snd_pcm_hw_params_t *hw_params;
+    snd_pcm_sw_params_t *sw_params;
 
     while ((opt = getopt(argc, argv, "f:h")) != -1) {
         switch (opt) {
@@ -205,31 +206,34 @@ int main(int argc, char *argv[])
     sigaction(SIGPIPE, &sigact, NULL);
 
     // Open PCM device for playback
-    rc = snd_pcm_open(&handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    rc = snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
     if (rc < 0) {
         fprintf(stderr, "unable to open pcm device: %s\n", snd_strerror(rc));
         exit(1);
     }
 
     // Allocate a hardware parameters object
-    snd_pcm_hw_params_alloca(&params);
-    snd_pcm_hw_params_any(handle, params);
-    snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16);
-    snd_pcm_hw_params_set_channels(handle, params, 1);
-    snd_pcm_hw_params_set_rate_near(handle, params, &PCM_Fs, NULL);
+    snd_pcm_hw_params_alloca(&hw_params);
+    snd_pcm_hw_params_any(pcm_handle, hw_params);
+    snd_pcm_hw_params_set_access(pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm_handle, hw_params, SND_PCM_FORMAT_S16);
+    snd_pcm_hw_params_set_channels(pcm_handle, hw_params, 1);
+    snd_pcm_hw_params_set_rate_near(pcm_handle, hw_params, &PCM_Fs, NULL);
     printf("ALSA PCM Sample Rate = %d Hz\n", PCM_Fs);
-    snd_pcm_hw_params_set_period_size_near(handle, params, &frames, NULL);
-    printf("ALSA PCM Sample Period = %ld Frames\n", frames);
-    snd_pcm_hw_params_set_buffer_size(handle, params, 8192U);
-    // Write the parameters to the driver
-    rc = snd_pcm_hw_params(handle, params);
+    snd_pcm_hw_params_set_buffer_size_near(pcm_handle, hw_params, &buffer_size);
+    snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, NULL);
+    printf("ALSA PCM Sample Period Size = %ld\n", period_size);
+    rc = snd_pcm_hw_params(pcm_handle, hw_params);
     if (rc < 0) {
         fprintf(stderr, "unable to set hw parameters: %s\n", snd_strerror(rc));
         exit(1);
     }
-
-    buffer = malloc(sizeof(int16_t) * frames);
+    buffer = malloc(period_size * sizeof(int16_t));
+    snd_pcm_sw_params_malloc(&sw_params);
+    snd_pcm_sw_params_current(pcm_handle, sw_params);
+    snd_pcm_sw_params_set_start_threshold(pcm_handle, sw_params, buffer_size - period_size);
+    snd_pcm_sw_params_set_avail_min(pcm_handle, sw_params, period_size);
+    snd_pcm_sw_params(pcm_handle, sw_params);
 
     // PCM Thread Begin
     rc = pthread_create(&pcm_thread, NULL, snd_pcm_thread, NULL);
@@ -342,9 +346,9 @@ int main(int argc, char *argv[])
     pthread_join(pcm_thread, NULL);
 
     // Close PCM
-    snd_pcm_drop(handle);
-    snd_pcm_drain(handle);
-    snd_pcm_close(handle);
+    snd_pcm_drop(pcm_handle);
+    snd_pcm_drain(pcm_handle);
+    snd_pcm_close(pcm_handle);
     free(buffer);
 
     // Finished with device so uninitialise it
