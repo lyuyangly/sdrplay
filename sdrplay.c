@@ -6,15 +6,17 @@
 #include <math.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <alsa/asoundlib.h>
 #include <sdrplay_api.h>
 
 #define FIR_TAPS 32
-#define PCM_FRMS 64
 
 static volatile int do_exit = 0;
 snd_pcm_t *handle;
-snd_pcm_uframes_t frames = PCM_FRMS;
+pthread_mutex_t g_pcm_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t g_pcm_cond = PTHREAD_COND_INITIALIZER;
+snd_pcm_uframes_t frames = 64;
 sdrplay_api_DeviceT *chosenDevice = NULL;
 
 // Fir31, Gain = 1022, Fc = 0.1
@@ -27,12 +29,30 @@ int32_t audio_buf[FIR_TAPS] = {0};
 size_t  demodcnt = 0;
 int16_t ri_last = 0, rq_last = 0;
 uint32_t pcm_cnt = 0;
-int16_t buffer[PCM_FRMS];
+int16_t *buffer;
+
+void *snd_pcm_thread(void *args)
+{
+    int rc = 0;
+    while (!do_exit) {
+        pthread_mutex_lock(&g_pcm_mutex);
+        pthread_cond_wait(&g_pcm_cond, &g_pcm_mutex);
+        pthread_mutex_unlock(&g_pcm_mutex);
+        rc = snd_pcm_writei(handle, buffer, frames);
+        if (rc == -EPIPE) {
+            fprintf(stderr, "underrun occurred\n");
+            snd_pcm_prepare(handle);
+        } else if (rc < 0) {
+            fprintf(stderr,"error from writei: %s\n", snd_strerror(rc));
+        } else if (rc != frames) {
+            fprintf(stderr,"short write, write %d frames\n", rc);
+        }
+    }
+    return args;
+}
 
 void StreamACallback(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params, unsigned int numSamples, unsigned int reset, void *cbContext)
 {
-    int rc = 0;
-
     // Process stream callback data here
    for (size_t i = 0; i < numSamples; ++i, xi++, xq++) {
         int32_t ri = 0, rq = 0;
@@ -82,15 +102,9 @@ void StreamACallback(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params, 
                 buffer[pcm_cnt++] = pcm;
                 if (pcm_cnt == frames) {
                     pcm_cnt = 0;
-                    rc = snd_pcm_writei(handle, buffer, frames);
-                    if (rc == -EPIPE) {
-                        fprintf(stderr, "underrun occurred\n");
-                        snd_pcm_prepare(handle);
-                    } else if (rc < 0) {
-                        fprintf(stderr,"error from writei: %s\n", snd_strerror(rc));
-                    } else if (rc != frames) {
-                        fprintf(stderr,"short write, write %d frames\n", rc);
-                    }
+                    pthread_mutex_lock(&g_pcm_mutex);
+                    pthread_cond_signal(&g_pcm_cond);
+                    pthread_mutex_unlock(&g_pcm_mutex);
                 }
             }
 
@@ -156,11 +170,12 @@ int main(int argc, char *argv[])
     sdrplay_api_DeviceT devs[3];
     unsigned int ndev;
     char c;
-    unsigned int val;
     int i, opt, rc, dir;
     double Freq = 97.9e6;
-    double Fs = 3.2e6;
+    double Fs = 2.4e6;
+    unsigned int PCM_Fs = 24000;
     struct sigaction sigact;
+    pthread_t pcm_thread;
     sdrplay_api_ErrT err;
     sdrplay_api_DeviceParamsT *deviceParams = NULL;
     sdrplay_api_CallbackFnsT cbFns;
@@ -197,24 +212,29 @@ int main(int argc, char *argv[])
 
     // Allocate a hardware parameters object
     snd_pcm_hw_params_alloca(&params);
-    // Fill it in with default values
     snd_pcm_hw_params_any(handle, params);
-    // Interleaved mode
     snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    // Signed 16-bit format
     snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16);
-    // Two channels (mono)
     snd_pcm_hw_params_set_channels(handle, params, 1);
-    // 32000 samples/second sampling rate
-    val = 32000;
-    snd_pcm_hw_params_set_rate_near(handle, params, &val, &dir);
-    // Set period pcm frames
+    snd_pcm_hw_params_set_rate_near(handle, params, &PCM_Fs, &dir);
+    printf("ALSA PCM Sample Rate = %d\n Hz", PCM_Fs);
     snd_pcm_hw_params_set_period_size_near(handle, params, &frames, &dir);
+    printf("ALSA PCM Sample Period = %ld Frames\n", frames);
+    snd_pcm_hw_params_set_buffer_size(handle, params, 8192U);
     // Write the parameters to the driver
     rc = snd_pcm_hw_params(handle, params);
     if (rc < 0) {
         fprintf(stderr, "unable to set hw parameters: %s\n", snd_strerror(rc));
         exit(1);
+    }
+
+    buffer = malloc(sizeof(int16_t) * 2 * frames);
+
+    // PCM Thread Begin
+    rc = pthread_create(&pcm_thread, NULL, snd_pcm_thread, NULL);
+    if (rc != 0) {
+        printf("PCM Thread Error!\n");
+        return 0;
     }
 
     // SDRPlay Initialize
@@ -285,12 +305,13 @@ int main(int argc, char *argv[])
     }
 
     while (1) {
-        if (do_exit !=0) {
+        if (do_exit != 0) {
             break;
         }
 
         c = getchar();
         if (c == 'q') {
+            do_exit = 1;
             break;
         }
         else if (c == 'u') {
@@ -316,6 +337,15 @@ int main(int argc, char *argv[])
         usleep(100000);
     }
 
+    // PCM Thread End
+    pthread_join(pcm_thread, NULL);
+
+    // Close PCM
+    snd_pcm_drop(handle);
+    snd_pcm_drain(handle);
+    snd_pcm_close(handle);
+    free(buffer);
+
     // Finished with device so uninitialise it
     if ((err = sdrplay_api_Uninit(chosenDevice->dev)) != sdrplay_api_Success) {
         printf("sdrplay_api_Uninit failed %s\n", sdrplay_api_GetErrorString(err));
@@ -329,11 +359,6 @@ UnlockDeviceAndCloseApi:
 
 CloseApi:
     sdrplay_api_Close();
-
-    // Close PCM
-    snd_pcm_drop(handle);
-    snd_pcm_drain(handle);
-    snd_pcm_close(handle);
 
     return 0;
 }
