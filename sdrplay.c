@@ -34,6 +34,7 @@ int16_t *buffer;
 void *snd_pcm_thread(void *args)
 {
     int rc = 0;
+    snd_pcm_prepare(handle);
     while (!do_exit) {
         pthread_mutex_lock(&g_pcm_mutex);
         pthread_cond_wait(&g_pcm_cond, &g_pcm_mutex);
@@ -170,7 +171,7 @@ int main(int argc, char *argv[])
     sdrplay_api_DeviceT devs[3];
     unsigned int ndev;
     char c;
-    int i, opt, rc, dir;
+    int i, opt, rc;
     double Freq = 97.9e6;
     double Fs = 2.4e6;
     unsigned int PCM_Fs = 24000;
@@ -216,9 +217,9 @@ int main(int argc, char *argv[])
     snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
     snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16);
     snd_pcm_hw_params_set_channels(handle, params, 1);
-    snd_pcm_hw_params_set_rate_near(handle, params, &PCM_Fs, &dir);
-    printf("ALSA PCM Sample Rate = %d\n Hz", PCM_Fs);
-    snd_pcm_hw_params_set_period_size_near(handle, params, &frames, &dir);
+    snd_pcm_hw_params_set_rate_near(handle, params, &PCM_Fs, NULL);
+    printf("ALSA PCM Sample Rate = %d Hz\n", PCM_Fs);
+    snd_pcm_hw_params_set_period_size_near(handle, params, &frames, NULL);
     printf("ALSA PCM Sample Period = %ld Frames\n", frames);
     snd_pcm_hw_params_set_buffer_size(handle, params, 8192U);
     // Write the parameters to the driver
@@ -228,7 +229,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    buffer = malloc(sizeof(int16_t) * 2 * frames);
+    buffer = malloc(sizeof(int16_t) * frames);
 
     // PCM Thread Begin
     rc = pthread_create(&pcm_thread, NULL, snd_pcm_thread, NULL);
